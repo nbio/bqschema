@@ -2,6 +2,7 @@ package bqschema
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"time"
@@ -10,92 +11,98 @@ import (
 )
 
 var (
-	ArrayOfArray = errors.New("Array of Arrays not allowed")
-	UnknownType  = errors.New("Unknown type")
-	NotStruct    = errors.New("Can not convert non structs")
+	ErrArrayOfArray = errors.New("Array of Arrays not allowed")
+	ErrNotStruct    = errors.New("Can not convert non structs")
+
+	// Legacy errors below. Exported names kept for compatibility.
+
+	ArrayOfArray = ErrArrayOfArray
+	NotStruct    = ErrNotStruct
+	UnknownType  = errors.New("Unknown type") // no longer used
 )
 
+// ToSchema converts the passed type to a BigQuery table schema.
 func ToSchema(src interface{}) (*bigquery.TableSchema, error) {
 	value := reflect.ValueOf(src)
 	t := value.Type()
 
 	schema := &bigquery.TableSchema{}
 
-	if t.Kind() == reflect.Struct {
-		schema.Fields = make([]*bigquery.TableFieldSchema, 0, t.NumField())
-		for i := 0; i < t.NumField(); i++ {
-			sf := t.Field(i)
-			if sf.PkgPath != "" { // unexported
-				continue
-			}
-			v := pointerGuard(value.Field(i))
-
-			var name string
-			jsonTag := sf.Tag.Get("json")
-			switch jsonTag {
-			case "-":
-				continue
-			case "":
-				name = sf.Name
-			default:
-				name = strings.Split(jsonTag, ",")[0]
-			}
-
-			tfs := &bigquery.TableFieldSchema{
-				Mode: "required",
-				Name: name,
-				Type: "",
-			}
-			schema.Fields = append(schema.Fields, tfs)
-
-			kind := v.Kind()
-			t, isSimple := simpleType(kind)
-
-			if isSimple {
-				tfs.Type = t
-			} else {
-				switch kind {
-				case reflect.Struct:
-					tfs.Mode = "nullable"
-					if t, fields, err := structConversion(v.Interface()); err == nil {
-						tfs.Type = t
-						if t == "string" {
-							tfs.Mode = "required"
-						}
-						tfs.Fields = fields
-					} else {
-						return schema, err
-					}
-				case reflect.Array, reflect.Slice:
-					tfs.Mode = "repeated"
-					subKind := pointerGuard(v.Type().Elem()).Kind()
-					t, isSimple := simpleType(subKind)
-					if isSimple {
-						schema.Fields[i].Type = t
-					} else if subKind == reflect.Struct {
-						subStruct := reflect.Zero(pointerGuard(v.Type().Elem()).Type()).Interface()
-						if t, fields, err := structConversion(subStruct); err == nil {
-							schema.Fields[i].Type = t
-							schema.Fields[i].Fields = fields
-
-						} else {
-							return schema, err
-						}
-					} else {
-						return schema, ArrayOfArray
-					}
-				default:
-					return schema, UnknownType
-				}
-			}
-		}
-	} else {
-		return schema, NotStruct
+	if t.Kind() != reflect.Struct {
+		return schema, ErrNotStruct
 	}
+	schema.Fields = make([]*bigquery.TableFieldSchema, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if sf.PkgPath != "" { // unexported
+			continue
+		}
+		v := pointerGuard(value.Field(i))
 
+		var name string
+		jsonTag := sf.Tag.Get("json")
+		switch jsonTag {
+		case "-":
+			continue
+		case "":
+			name = sf.Name
+		default:
+			name = strings.Split(jsonTag, ",")[0]
+		}
+
+		tfs := &bigquery.TableFieldSchema{
+			Mode: "required",
+			Name: name,
+			Type: "",
+		}
+		schema.Fields = append(schema.Fields, tfs)
+
+		kind := v.Kind()
+		t, isSimple := simpleType(kind)
+
+		if isSimple {
+			tfs.Type = t
+			continue
+		}
+
+		switch kind {
+		case reflect.Struct:
+			tfs.Mode = "nullable"
+			if t, fields, err := structConversion(v.Interface()); err == nil {
+				tfs.Type = t
+				if t == "string" {
+					tfs.Mode = "required"
+				}
+				tfs.Fields = fields
+			} else {
+				return schema, err
+			}
+		case reflect.Array, reflect.Slice:
+			tfs.Mode = "repeated"
+			subKind := pointerGuard(v.Type().Elem()).Kind()
+			t, isSimple := simpleType(subKind)
+			if isSimple {
+				schema.Fields[i].Type = t
+			} else if subKind == reflect.Struct {
+				subStruct := reflect.Zero(pointerGuard(v.Type().Elem()).Type()).Interface()
+				if t, fields, err := structConversion(subStruct); err == nil {
+					schema.Fields[i].Type = t
+					schema.Fields[i].Fields = fields
+
+				} else {
+					return schema, err
+				}
+			} else {
+				return schema, ErrArrayOfArray
+			}
+		default:
+			return schema, &ErrInconvertibleType{sf.Type.String()}
+		}
+	}
 	return schema, nil
 }
 
+// MustToSchema panics if conversion to a schema encounters an error.
 func MustToSchema(src interface{}) *bigquery.TableSchema {
 	schema, err := ToSchema(src)
 	if err != nil {
@@ -148,4 +155,13 @@ func pointerGuard(i interface{}) reflect.Value {
 		v = reflect.Indirect(reflect.New(v.Type().Elem()))
 	}
 	return v
+}
+
+// ErrInconvertibleType reports a type that cannot be converted to a BigQuery schema.
+type ErrInconvertibleType struct {
+	TypeName string
+}
+
+func (e *ErrInconvertibleType) Error() string {
+	return fmt.Sprintf("inconvertible type: %s", e.TypeName)
 }
